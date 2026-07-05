@@ -1,0 +1,36 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+venv/
+.venv/
+
+# PyInstaller 打包产物（可从源码重新打）
+build/
+dist/
+*.spec
+
+# 运行时数据（每台电脑独立生成，不进仓库）
+config.json
+reminders.json
+drink_entries.json
+history.json
+
+# 内部开发文档（不提交）
+CLAUDE.md
+docs/
+previews/
+render_previews.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
