@@ -1425,6 +1425,26 @@ class MainWindow(QMainWindow):
         # 用户主动打开主窗口 → 立即停 flash
         if self._flash_timer.isActive() or self._flash_count > 0:
             self._stop_flash()
+        # 位置纠错：pythonw / PyInstaller 打包 exe 启动时 Windows/Qt 有时把
+        # 主窗口位置回填成 (-25600, -25600) 之类的屏幕外坐标，__init__ 里的
+        # self.move() 会被 show() 之后的这次回填覆盖。这里每次 show 都验证：
+        # 如果当前几何在可视屏幕外，强制拉回屏幕中心。
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            g = self.geometry()
+            offscreen = (
+                g.x() < avail.x() - 100
+                or g.y() < avail.y() - 100
+                or g.x() > avail.right() - 100
+                or g.y() > avail.bottom() - 100
+            )
+            if offscreen:
+                w = max(self.width(), self.minimumWidth())
+                h = max(self.height(), self.minimumHeight())
+                x = avail.x() + (avail.width() - w) // 2
+                y = avail.y() + max(60, (avail.height() - h) // 3)
+                self.move(x, y)
         super().showEvent(event)
 
     # --- 首次启动 Toast ---
