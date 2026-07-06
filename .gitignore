@@ -20,6 +20,7 @@ history.json
 
 # 内部开发文档（不提交）
 CLAUDE.md
+HANDOVER.md
 docs/
 previews/
 render_previews.py

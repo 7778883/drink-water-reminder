@@ -26,6 +26,7 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QTime,
     QTimer,
 )
 from PySide6.QtGui import (
@@ -57,6 +58,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSystemTrayIcon,
+    QTimeEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -79,11 +81,35 @@ HISTORY_PATH = BASE_DIR / "history.json"
 START_BAT_PATH = BASE_DIR / "start.bat"
 STARTUP_FOLDER = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 STARTUP_LINK_NAME = "喝水小助手.bat"
-FOLLOW_UP_MIN = 5  # "推迟 5 分钟"按钮的延后时长
-PENDING_WINDOW_MIN = 2  # 用户关 X / 不理弹窗后，主窗口按钮保持可点的时长
-SCHEMA_VERSION = 3
+FOLLOW_UP_MIN = 5  # 推迟/不理后的再提醒延时（分钟）
+RESPONSE_WINDOW_MIN = 5  # 提醒弹出后等响应的时长（分钟），超时视为不理
+PROACTIVE_COOLDOWN_MIN = 20  # 主动记水冷却：距上次喝水记录不足这么久 → 拒记
+IDLE_AWAY_MIN = 5  # 无键鼠输入超过这么久（分钟）视为人不在电脑前，挂起一切计时和惩罚
+WAKE_CATCHUP_MIN = 30  # 离开超过这么久（分钟），回来时自动补弹一次提醒
+SCHEMA_VERSION = 4
 STAGE_COUNT = 9  # 0-8 共 9 档成长阶段（均匀 11.1% 一档）
 SKIP_RESET_THRESHOLD = 3  # 连续跳过达到此值 → 视觉重置到种子（drunk_ml 保留）
+
+
+def get_idle_seconds() -> float:
+    """距最后一次键鼠输入的秒数（Windows GetLastInputInfo）。
+    锁屏/熄屏/人离开都表现为无输入，统一按这个口径判定"人不在"。
+    API 不可用（非 Windows / 调用失败）返回 0，等于永不判定离开。"""
+    try:
+        import ctypes
+
+        class _LastInputInfo(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        lii = _LastInputInfo()
+        lii.cbSize = ctypes.sizeof(_LastInputInfo)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        elapsed_ms = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+        # GetTickCount 32 位回绕（49.7 天）会出负数，按 0 处理
+        return max(0.0, elapsed_ms / 1000.0)
+    except Exception:
+        return 0.0
 
 
 def sync_startup_shortcut(enabled: bool) -> bool:
@@ -387,6 +413,13 @@ def _read_json_list(path: Path) -> list:
     return raw if isinstance(raw, list) else []
 
 
+def _filter_known_fields(cls, raw: dict) -> dict:
+    """dataclass 构造前滤掉未知字段。旧 schema 文件里已删除的字段（如
+    expected_drink_ml / final_wilt_level）直接丢弃，防 TypeError。"""
+    known = {f.name for f in cls.__dataclass_fields__.values()}
+    return {k: v for k, v in raw.items() if k in known}
+
+
 # ----------------------------- 数据对象 -----------------------------
 
 
@@ -394,7 +427,6 @@ def _read_json_list(path: Path) -> list:
 class TodayState:
     date: str = ""
     drunk_ml: int = 0
-    wilt_level: int = 0
     last_reminder_ts: Optional[str] = None
     # 当前是否有一次"未处理"的提醒在等用户响应。
     # True：可以记一次喝水（弹窗里点已喝、或主窗口点我喝水了），任何一种都只生效一次
@@ -405,9 +437,13 @@ class TodayState:
     reminder_count: int = 0
     drank_count: int = 0
     session_started_at: Optional[str] = None  # 当天首次提醒时间戳（跨日归档用）
-    # v3 新增：替代 wilt_level 的新语义
+    # v3 新增
     skip_count: int = 0  # 连续跳过次数（0/1/2），已喝归零，到 SKIP_RESET_THRESHOLD 触发视觉重置
     visual_reset_ml: int = 0  # 视觉基线：stage 从 (drunk_ml - visual_reset_ml) / goal 算
+    # v4 新增：待兑现的再提醒（推迟/不理产生）。存墙上时钟到期时间并落盘，
+    # app 重启 / 系统睡眠唤醒后由 _tick 兑现，不依赖 QTimer 间隔
+    followup_due_ts: Optional[str] = None
+    followup_source: Optional[str] = None  # snoozed_followup / ignored_followup
 
 
 @dataclass
@@ -416,8 +452,7 @@ class Reminder:
 
     id: str
     triggered_at: str  # ISO datetime
-    expected_drink_ml: int
-    source: str  # scheduled / manual / snoozed_followup / catch_up
+    source: str  # scheduled / snoozed_followup / ignored_followup / catch_up
     response: Optional[str] = None  # drank / skipped / snoozed / ignored
     responded_at: Optional[str] = None
     actual_drunk_ml: Optional[int] = None
@@ -445,7 +480,6 @@ class HistoryEntry:
     daily_goal_ml_snapshot: int
     is_goal_reached: bool
     final_growth_stage: int
-    final_wilt_level: int
     reminder_count: int
     response_breakdown: dict  # {drank: N, skipped: N, snoozed: N, ignored: N}
     drink_entry_ids: list  # 当天 DrinkEntry id 列表
@@ -462,6 +496,10 @@ class Config:
     per_cup_ml: int = 250
     daily_goal_ml: int = 2000
     launch_on_startup: bool = False
+    # v4 新增：免打扰时段（睡觉时间不提醒），HH:MM，支持跨午夜
+    quiet_enabled: bool = True
+    quiet_start: str = "23:00"
+    quiet_end: str = "08:00"
     schema_version: int = SCHEMA_VERSION
     today: TodayState = field(default_factory=TodayState)
 
@@ -491,9 +529,11 @@ class Config:
             today_raw.setdefault("reminder_count", 0)
             today_raw.setdefault("drank_count", 0)
             today_raw.setdefault("session_started_at", None)
-            # v2 → v3 字段（wilt_level 保留不动，视觉不再用它，只作历史兼容）
+            # v2 → v3 字段
             today_raw.setdefault("skip_count", 0)
             today_raw.setdefault("visual_reset_ml", 0)
+            # v3 → v4：wilt_level 删除（由下方未知字段过滤自动丢弃），
+            # followup_* / quiet_* 新字段靠 dataclass 默认值补齐，无需 setdefault
 
         # 过滤掉未知字段，防 TodayState(**today_raw) 抛 TypeError
         known_fields = {f.name for f in TodayState.__dataclass_fields__.values()}
@@ -504,6 +544,9 @@ class Config:
             per_cup_ml=raw.get("per_cup_ml", 250),
             daily_goal_ml=raw.get("daily_goal_ml", 2000),
             launch_on_startup=raw.get("launch_on_startup", False),
+            quiet_enabled=raw.get("quiet_enabled", True),
+            quiet_start=raw.get("quiet_start", "23:00"),
+            quiet_end=raw.get("quiet_end", "08:00"),
             schema_version=SCHEMA_VERSION,
             today=TodayState(**today_raw) if today_raw else TodayState(),
         )
@@ -555,7 +598,10 @@ class RemindersStore:
         self.path = path
 
     def load(self) -> list[Reminder]:
-        return [Reminder(**r) for r in _read_json_list(self.path)]
+        return [
+            Reminder(**_filter_known_fields(Reminder, r))
+            for r in _read_json_list(self.path)
+        ]
 
     def _save_all(self, items: list[Reminder]) -> None:
         atomic_write_json(self.path, [asdict(r) for r in items])
@@ -583,7 +629,10 @@ class DrinkEntriesStore:
         self.path = path
 
     def load(self) -> list[DrinkEntry]:
-        return [DrinkEntry(**e) for e in _read_json_list(self.path)]
+        return [
+            DrinkEntry(**_filter_known_fields(DrinkEntry, e))
+            for e in _read_json_list(self.path)
+        ]
 
     def _save_all(self, items: list[DrinkEntry]) -> None:
         atomic_write_json(self.path, [asdict(e) for e in items])
@@ -601,7 +650,10 @@ class HistoryStore:
         self.path = path
 
     def load(self) -> list[HistoryEntry]:
-        return [HistoryEntry(**h) for h in _read_json_list(self.path)]
+        return [
+            HistoryEntry(**_filter_known_fields(HistoryEntry, h))
+            for h in _read_json_list(self.path)
+        ]
 
     def _save_all(self, items: list[HistoryEntry]) -> None:
         atomic_write_json(self.path, [asdict(h) for h in items])
@@ -728,6 +780,20 @@ class SettingsDialog(QDialog):
         self.goal_spin.setValue(cfg.daily_goal_ml)
         form.addRow("每日目标", self.goal_spin)
 
+        self.quiet_checkbox = QCheckBox("夜间免打扰（此时段不弹提醒）")
+        self.quiet_checkbox.setChecked(cfg.quiet_enabled)
+        form.addRow("", self.quiet_checkbox)
+
+        self.quiet_start_edit = QTimeEdit()
+        self.quiet_start_edit.setDisplayFormat("HH:mm")
+        self.quiet_start_edit.setTime(QTime.fromString(cfg.quiet_start, "HH:mm"))
+        form.addRow("免打扰开始", self.quiet_start_edit)
+
+        self.quiet_end_edit = QTimeEdit()
+        self.quiet_end_edit.setDisplayFormat("HH:mm")
+        self.quiet_end_edit.setTime(QTime.fromString(cfg.quiet_end, "HH:mm"))
+        form.addRow("免打扰结束", self.quiet_end_edit)
+
         self.startup_checkbox = QCheckBox("开机自启动")
         self.startup_checkbox.setChecked(cfg.launch_on_startup)
         form.addRow("", self.startup_checkbox)
@@ -745,6 +811,9 @@ class SettingsDialog(QDialog):
         cfg.interval_min = self.interval_spin.value()
         cfg.per_cup_ml = self.cup_spin.value()
         cfg.daily_goal_ml = self.goal_spin.value()
+        cfg.quiet_enabled = self.quiet_checkbox.isChecked()
+        cfg.quiet_start = self.quiet_start_edit.time().toString("HH:mm")
+        cfg.quiet_end = self.quiet_end_edit.time().toString("HH:mm")
         want_startup = self.startup_checkbox.isChecked()
         if want_startup != cfg.launch_on_startup:
             # 同步启动文件夹：成功才更新 cfg 字段（避免 config 说开着但文件系统不一致）
@@ -784,10 +853,21 @@ class MainWindow(QMainWindow):
         # 跨日归档挂起标记（dialog 已删除后仅剩 SettingsDialog 场景触发）
         self._dialog_visible = False
         self._pending_rollover = False
-        # snoozed 状态跟踪
-        self._snoozed_until: Optional[datetime] = None
-        # β2 视觉降级标记：2 分钟软超时后 True，pending 仍保留可点
-        self._pending_visually_degraded = False
+        # 当前 pending 提醒的响应截止时间（墙上时钟，超时视为不理）
+        self._pending_deadline: Optional[datetime] = None
+        # 下次定时提醒的到期时间（墙上时钟）。None = 周期停止（达标后）
+        self._next_reminder_due: Optional[datetime] = None
+        # 人不在电脑前的起点（无输入超 IDLE_AWAY_MIN 分钟时设置）
+        self._away_since: Optional[datetime] = None
+        # 最近一次喝水记录时间（主动记水冷却用），启动时从 drink_entries 恢复，
+        # 防止重启绕过冷却
+        self._last_drink_ts: Optional[datetime] = None
+        _entries = self.drink_entries_store.load()
+        if _entries:
+            try:
+                self._last_drink_ts = datetime.fromisoformat(_entries[-1].timestamp)
+            except (ValueError, TypeError):
+                self._last_drink_ts = None
         # 记录切换动画对象（避免被 GC）
         self._layout_anim: Optional[QPropertyAnimation] = None
         # 上一次布局是否是提醒态（判断是否需要触发切换动画）
@@ -955,14 +1035,6 @@ class MainWindow(QMainWindow):
 
         rz_layout.addLayout(btn_row)
 
-        # 降级态：单个补打卡按钮，隐藏在提醒 zone 里
-        self.degraded_btn = QPushButton("刚才没喝？现在也行")
-        self.degraded_btn.setObjectName("drink_primary_btn")
-        self.degraded_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.degraded_btn.setAutoDefault(False)
-        self.degraded_btn.clicked.connect(self._on_reminder_drank)
-        rz_layout.addWidget(self.degraded_btn)
-
         az_layout.addWidget(self.reminder_zone)
 
         # 行动区淡入淡出用的透明度 effect（常驻，避免 GC）
@@ -974,22 +1046,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # 计时器
-        self.reminder_timer = QTimer(self)
-        self.reminder_timer.timeout.connect(self.show_reminder)
-        # 2 分钟软超时（β2：不清 pending，只做视觉降级）
-        self.pending_timer = QTimer(self)
-        self.pending_timer.setSingleShot(True)
-        self.pending_timer.timeout.connect(self._on_pending_timeout)
-
         # 跨日切换检查
         self.day_check_timer = QTimer(self)
         self.day_check_timer.timeout.connect(self.check_day_rollover)
         self.day_check_timer.start(60 * 1000)  # 每分钟检查
 
-        # 倒计时 tick
+        # 每秒 tick：兑现到期事件 + 刷倒计时
         self.countdown_timer = QTimer(self)
-        self.countdown_timer.timeout.connect(self._update_countdown)
+        self.countdown_timer.timeout.connect(self._tick)
         self.countdown_timer.start(1000)
 
         # 30 秒 raise singleShot 引用（记着可取消）
@@ -1040,26 +1104,17 @@ class MainWindow(QMainWindow):
         if show_reminder_layout:
             self.normal_zone.setVisible(False)
             self.reminder_zone.setVisible(True)
-            # β2：降级态显示单按钮，正常态显示 3 按钮
-            if self._pending_visually_degraded:
-                self.reminder_hint_label.setVisible(False)
-                self.gulp_btn.setVisible(False)
-                self.half_cup_btn.setVisible(False)
-                self.full_cup_btn.setVisible(False)
-                self.snooze_btn.setVisible(False)
-                self.skip_btn.setVisible(False)
-                self.degraded_btn.setVisible(True)
-            else:
-                self.reminder_hint_label.setVisible(True)
-                self.gulp_btn.setVisible(True)
-                self.half_cup_btn.setVisible(True)
-                self.full_cup_btn.setVisible(True)
-                self.snooze_btn.setVisible(True)
-                self.skip_btn.setVisible(True)
-                self.degraded_btn.setVisible(False)
-                # 提醒态半杯/一杯按钮文案跟随 per_cup_ml（同步常态那两个）
-                self.half_cup_btn.setText(f"喝半杯 +{per // 2}ml")
-                self.full_cup_btn.setText(f"喝一杯 +{per}ml")
+            # followup 提醒是最后一次机会，提示语说明利害（catch_up 不算）
+            is_second_chance = (
+                self._current_reminder is not None
+                and self._current_reminder.source in ("snoozed_followup", "ignored_followup")
+            )
+            self.reminder_hint_label.setText(
+                "再不喝小树要蔫了，就现在吧" if is_second_chance else "起来动一动，喝口水吧"
+            )
+            # 提醒态半杯/一杯按钮文案跟随 per_cup_ml（同步常态那两个）
+            self.half_cup_btn.setText(f"喝半杯 +{per // 2}ml")
+            self.full_cup_btn.setText(f"喝一杯 +{per}ml")
         else:
             self.reminder_zone.setVisible(False)
             self.normal_zone.setVisible(True)
@@ -1070,7 +1125,7 @@ class MainWindow(QMainWindow):
             self._last_layout_was_reminder = show_reminder_layout
 
         # 圆点色跟状态挂钩
-        if self._snoozed_until is not None:
+        if self.cfg.today.followup_due_ts is not None:
             self.status_dot.setObjectName("status_dot_snooze")
         elif pending:
             self.status_dot.setObjectName("status_dot_pending")
@@ -1098,34 +1153,111 @@ class MainWindow(QMainWindow):
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         self._layout_anim = anim
 
+    def _tick(self) -> None:
+        """每秒 tick：先兑现墙上时钟的到期事件，再刷倒计时文案。
+        用到期时间而不是 QTimer 间隔计时，系统睡眠唤醒 / app 重启后照样兑现。"""
+        now = datetime.now()
+        t = self.cfg.today
+
+        # 人不在检测：无键鼠输入超过 IDLE_AWAY_MIN 分钟（锁屏/熄屏/离开都算）
+        # → 挂起一切到期事件和惩罚。时间到了也记不到，不该弹也不该罚
+        idle_sec = get_idle_seconds()
+        if idle_sec >= IDLE_AWAY_MIN * 60:
+            if self._away_since is None:
+                self._away_since = now - timedelta(seconds=idle_sec)
+            self._update_countdown()
+            return
+        if self._away_since is not None:
+            away_sec = (now - self._away_since).total_seconds()
+            self._away_since = None
+            self._on_return_from_away(away_sec)
+
+        # followup 到期 → 再提醒（推迟 5 分钟 / 不理后的第二次机会）
+        if t.followup_due_ts and not t.reminder_pending:
+            due = self._parse_ts(t.followup_due_ts)
+            if due is None:
+                self._clear_followup()
+            elif now >= due:
+                src = t.followup_source or "snoozed_followup"
+                self._clear_followup()
+                self.show_reminder(source=src)
+
+        # 提醒弹出后超时无响应 → 按不理处理
+        if (
+            t.reminder_pending
+            and self._pending_deadline is not None
+            and now >= self._pending_deadline
+        ):
+            self._on_response_timeout()
+
+        # 定时提醒到期（墙上时钟，替代旧 QTimer 间隔计时）
+        if (
+            not t.reminder_pending
+            and self._next_reminder_due is not None
+            and now >= self._next_reminder_due
+        ):
+            self.show_reminder(source="scheduled")
+
+        self._update_countdown()
+
+    def _on_return_from_away(self, away_sec: float) -> None:
+        """人回到电脑前。离开够久 → 旧提醒作废（不惩罚，人不在不等于不理）+
+        补弹一次；短暂离开 → pending 的响应窗口重新给满。"""
+        if away_sec >= WAKE_CATCHUP_MIN * 60:
+            if self._current_reminder is not None and self._current_reminder.response is None:
+                self._current_reminder.response = "ignored"
+                self._current_reminder.responded_at = datetime.now().isoformat()
+                self.reminders_store.update(self._current_reminder)
+                self._current_reminder = None
+            self._pending_deadline = None
+            if self.cfg.today.reminder_pending:
+                self.cfg.today.reminder_pending = False
+                self.cfg.save()
+            self._clear_followup()
+            self.show_reminder(source="catch_up")
+        elif self.cfg.today.reminder_pending:
+            self._pending_deadline = datetime.now() + timedelta(minutes=RESPONSE_WINDOW_MIN)
+
+    @staticmethod
+    def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return None
+
     def _update_countdown(self) -> None:
-        """每秒 tick 刷新倒计时文案。状态优先级：达标 > snoozed > pending > 主 timer。"""
-        # 达标优先：今日已完成 → 停 timer + 显示达成文案
+        """刷新倒计时文案。状态优先级：达标 > pending > followup > 免打扰 > 主 timer。"""
         goal = self.cfg.daily_goal_ml
         if goal > 0 and self.cfg.today.drunk_ml >= goal:
             self.countdown_label.setText("今日已达成 · 明天见")
             return
 
-        if self._snoozed_until is not None and datetime.now() >= self._snoozed_until:
-            self._snoozed_until = None
-
-        if self._snoozed_until is not None:
-            self.countdown_label.setText("5 分钟后再提醒")
-            return
         if self.cfg.today.reminder_pending:
-            if self._pending_visually_degraded:
-                self.countdown_label.setText("刚才那次已过 · 可以补一口")
-            else:
-                self.countdown_label.setText("该喝水了 · 未响应")
+            self.countdown_label.setText("该喝水了 · 未响应")
             return
-        if not self.reminder_timer.isActive():
+
+        due = self._parse_ts(self.cfg.today.followup_due_ts)
+        if due is not None:
+            remaining = int((due - datetime.now()).total_seconds())
+            if remaining > 0:
+                self.countdown_label.setText(
+                    f"{remaining // 60:02d}:{remaining % 60:02d} 后再提醒"
+                )
+                return
+
+        if self._in_quiet_hours():
+            self.countdown_label.setText(f"免打扰中 · {self.cfg.quiet_end} 后恢复")
+            return
+
+        if self._next_reminder_due is None:
             self.countdown_label.setText("等待中…")
             return
-        remaining_ms = self.reminder_timer.remainingTime()
-        if remaining_ms <= 0:
+        total_seconds = int((self._next_reminder_due - datetime.now()).total_seconds())
+        if total_seconds <= 0:
             self.countdown_label.setText("即将提醒…")
             return
-        total_seconds = remaining_ms // 1000
         minutes = total_seconds // 60
         seconds = total_seconds % 60
         self.countdown_label.setText(f"距离下次提醒：{minutes:02d}:{seconds:02d}")
@@ -1133,16 +1265,96 @@ class MainWindow(QMainWindow):
     # --- 计时 ---
 
     def start_reminder_cycle(self) -> None:
-        self.reminder_timer.start(self.cfg.interval_min * 60 * 1000)
+        self._next_reminder_due = datetime.now() + timedelta(minutes=self.cfg.interval_min)
 
     def restart_reminder_cycle(self) -> None:
-        self.reminder_timer.stop()
-        self.reminder_timer.start(self.cfg.interval_min * 60 * 1000)
+        self.start_reminder_cycle()
+
+    def stop_reminder_cycle(self) -> None:
+        self._next_reminder_due = None
+
+    # --- 状态机辅助 ---
+
+    def _schedule_followup(self, source: str) -> None:
+        """FOLLOW_UP_MIN 分钟后再提醒。存墙上时钟到期时间并落盘，由 _tick 兑现。"""
+        due = datetime.now() + timedelta(minutes=FOLLOW_UP_MIN)
+        self.cfg.today.followup_due_ts = due.isoformat()
+        self.cfg.today.followup_source = source
+        self.cfg.save()
+
+    def _clear_followup(self) -> None:
+        if self.cfg.today.followup_due_ts or self.cfg.today.followup_source:
+            self.cfg.today.followup_due_ts = None
+            self.cfg.today.followup_source = None
+            self.cfg.save()
+
+    def _apply_skip_penalty(self) -> None:
+        """跳过 / 两次不理的惩罚：skip_count +1，到阈值视觉重置回种子（drunk_ml 保留）。"""
+        self.cfg.today.skip_count += 1
+        if self.cfg.today.skip_count >= SKIP_RESET_THRESHOLD:
+            self.cfg.today.visual_reset_ml = self.cfg.today.drunk_ml
+            self.cfg.today.skip_count = 0
+
+    def _in_quiet_hours(self, now: Optional[datetime] = None) -> bool:
+        """当前是否在免打扰时段。支持跨午夜（如 23:00-08:00）。"""
+        if not self.cfg.quiet_enabled:
+            return False
+        try:
+            sh, sm = (int(x) for x in self.cfg.quiet_start.split(":"))
+            eh, em = (int(x) for x in self.cfg.quiet_end.split(":"))
+        except (ValueError, AttributeError):
+            return False
+        start, end = sh * 60 + sm, eh * 60 + em
+        if start == end:
+            return False
+        moment = now or datetime.now()
+        cur = moment.hour * 60 + moment.minute
+        if start < end:
+            return start <= cur < end
+        return cur >= start or cur < end
+
+    def _proactive_cooldown_remaining_min(self) -> int:
+        """主动记水冷却剩余分钟数（向上取整），0 = 可以记。"""
+        if self._last_drink_ts is None:
+            return 0
+        elapsed = (datetime.now() - self._last_drink_ts).total_seconds()
+        remain = PROACTIVE_COOLDOWN_MIN * 60 - elapsed
+        if remain <= 0:
+            return 0
+        return int(remain // 60) + 1
+
+    def _show_cooldown_feedback(self, remain_min: int) -> None:
+        """主动记水被冷却拦下时的反馈，不允许静默失败。"""
+        text = f"刚记过一次啦，{remain_min} 分钟后可以再记"
+        if self.isVisible() and not self.isMinimized():
+            toast = FirstLaunchToast(text, parent=self.centralWidget())
+            self._toast = toast
+            toast.show_at_canvas_bottom(self.canvas, self.action_zone)
+        elif self._tray_icon_ref is not None:
+            self._tray_icon_ref.showMessage(
+                "喝水小助手",
+                text,
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
 
     def show_reminder(self, source: str = "scheduled") -> None:
-        """内嵌响应模式。删除 ReminderDialog 后，主窗口本身承担响应界面。"""
+        """内嵌响应模式。主窗口本身承担响应界面。"""
+        # 达标后不再提醒（followup 也吞掉），也不重启周期
+        goal = self.cfg.daily_goal_ml
+        if goal > 0 and self.cfg.today.drunk_ml >= goal:
+            self._clear_followup()
+            return
+
+        # 免打扰时段不弹。scheduled 重排下一轮；followup 直接作废（人在睡觉）
+        if self._in_quiet_hours():
+            self._clear_followup()
+            if source == "scheduled":
+                self.restart_reminder_cycle()
+            return
+
         # Debounce：防 QTimer 在系统休眠/时钟跳动后连触发（0.4 秒内 3 次的 bug）。
-        # 只对 scheduled 有效，snoozed_followup 是 5 分钟 lambda 独立触发不受影响。
+        # 只对 scheduled 有效，followup 走墙上时钟到期兑现不受影响。
         if source == "scheduled" and self.cfg.today.last_reminder_ts:
             try:
                 last = datetime.fromisoformat(self.cfg.today.last_reminder_ts)
@@ -1155,23 +1367,20 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 pass
 
-        # 上次还挂着未响应的 reminder → 抢占标 ignored（β2 状态机）
+        # 上次还挂着未响应的 reminder → 抢占标 ignored
         if self._current_reminder is not None and self._current_reminder.response is None:
             self._current_reminder.response = "ignored"
             self._current_reminder.responded_at = datetime.now().isoformat()
             self.reminders_store.update(self._current_reminder)
             self._current_reminder = None
 
-        self.pending_timer.stop()
-        self._snoozed_until = None
-        self._pending_visually_degraded = False
+        self._clear_followup()
         now_iso = datetime.now().isoformat()
 
         # 创建 Reminder
         reminder = Reminder(
             id=uuid.uuid4().hex,
             triggered_at=now_iso,
-            expected_drink_ml=self.cfg.per_cup_ml,
             source=source,
         )
         self.reminders_store.append(reminder)
@@ -1185,8 +1394,8 @@ class MainWindow(QMainWindow):
             self.cfg.today.session_started_at = now_iso
         self.cfg.save()
 
-        # 启动 2 分钟软超时
-        self.pending_timer.start(PENDING_WINDOW_MIN * 60 * 1000)
+        # 响应窗口：超时视为不理（墙上时钟，_tick 里检查）
+        self._pending_deadline = datetime.now() + timedelta(minutes=RESPONSE_WINDOW_MIN)
 
         # 刷新 UI 进入响应态
         self.refresh()
@@ -1204,25 +1413,47 @@ class MainWindow(QMainWindow):
             self._pending_rollover = False
             self.check_day_rollover()
 
-    def _on_pending_timeout(self) -> None:
-        """β2：2 分钟软超时。不清 pending、不标 ignored、不切回常态。
-        只做视觉降级：3 按钮 → 「刚才没喝？现在也行」单按钮。
-        真正的 ignored 标记 + pending 收回，延后到下次提醒抢占时。"""
+    def _on_response_timeout(self) -> None:
+        """提醒弹出 RESPONSE_WINDOW_MIN 分钟无响应 = 不理。
+        首次提醒（scheduled / catch_up）被不理 → 立即再提醒一次（第二次机会）。
+        followup 提醒（推迟/不理产生）再被不理 → 按跳过惩罚，本轮结束。"""
+        self._pending_deadline = None
         if not self.cfg.today.reminder_pending:
             return
-        self._pending_visually_degraded = True
-        self.refresh()
+        r = self._current_reminder
+        second_chance = r is not None and r.source in ("snoozed_followup", "ignored_followup")
+        if r is not None and r.response is None:
+            r.response = "ignored"
+            r.responded_at = datetime.now().isoformat()
+            self.reminders_store.update(r)
+        self._current_reminder = None
+        self.cfg.today.reminder_pending = False
+        self.cfg.save()
+        if second_chance:
+            self._apply_skip_penalty()
+            self.cfg.save()
+            self.refresh()
+        else:
+            self.refresh()
+            self.show_reminder(source="ignored_followup")
 
     def _record_drink(self, ml: int, source: str = "response") -> None:
         """记一次喝水。
 
         source 语义：
         - response / supplement：需要 reminder_pending=True 才生效（单次幂等）
-        - proactive：无论 pending 与否都记账，不消耗当前 pending 状态
+        - proactive：不消耗 pending，但受 PROACTIVE_COOLDOWN_MIN 冷却约束
         """
-        now_iso = datetime.now().isoformat()
+        now = datetime.now()
+        now_iso = now.isoformat()
 
         if source == "proactive":
+            # 物理合理性约束：距上次喝水记录不足冷却时长 → 拒记并给反馈。
+            # 人不会 20 分钟内主动喝两次，连点只是给树浇假水
+            remain = self._proactive_cooldown_remaining_min()
+            if remain > 0:
+                self._show_cooldown_feedback(remain)
+                return
             # 主动喝一口：不消耗 pending、不清 current_reminder
             entry = DrinkEntry(
                 id=uuid.uuid4().hex,
@@ -1233,14 +1464,15 @@ class MainWindow(QMainWindow):
                 linked_reminder_id=None,
             )
             self.drink_entries_store.append(entry)
+            self._last_drink_ts = now
             self.add_water(ml)
             # v3：任何"已喝"都清 skip_count（回到 s0 健康态）
             self.cfg.today.skip_count = 0
             self.cfg.save()
-            # 达标后停 timer 不再提醒；未达标才重置周期
+            # 达标后停周期不再提醒；未达标才重置周期
             goal = self.cfg.daily_goal_ml
             if goal > 0 and self.cfg.today.drunk_ml >= goal:
-                self.reminder_timer.stop()
+                self.stop_reminder_cycle()
             else:
                 self.restart_reminder_cycle()
             self.refresh()
@@ -1270,17 +1502,17 @@ class MainWindow(QMainWindow):
             self._current_reminder = None
 
         self.add_water(ml)
-        # v3：已喝清 skip_count（回到 s0 健康态），wilt_level 不再动
+        self._last_drink_ts = now
+        # v3：已喝清 skip_count（回到 s0 健康态）
         self.cfg.today.skip_count = 0
         self.cfg.today.reminder_pending = False
         self.cfg.today.drank_count += 1
-        self._pending_visually_degraded = False
-        self.pending_timer.stop()
+        self._pending_deadline = None
         self.cfg.save()
-        # 达标后停 timer 不再提醒；未达标才重置周期
+        # 达标后停周期不再提醒；未达标才重置周期
         goal = self.cfg.daily_goal_ml
         if goal > 0 and self.cfg.today.drunk_ml >= goal:
-            self.reminder_timer.stop()
+            self.stop_reminder_cycle()
         else:
             self.restart_reminder_cycle()
         self.refresh()
@@ -1297,13 +1529,9 @@ class MainWindow(QMainWindow):
             self.reminders_store.update(self._current_reminder)
             self._current_reminder = None
         # v3：skip_count +1，到阈值触发视觉重置（视觉回种子，drunk_ml 保留）
-        self.cfg.today.skip_count += 1
-        if self.cfg.today.skip_count >= SKIP_RESET_THRESHOLD:
-            self.cfg.today.visual_reset_ml = self.cfg.today.drunk_ml
-            self.cfg.today.skip_count = 0
+        self._apply_skip_penalty()
         self.cfg.today.reminder_pending = False
-        self._pending_visually_degraded = False
-        self.pending_timer.stop()
+        self._pending_deadline = None
         self.cfg.save()
         # 跳过 = 用户表态，重置主 timer，60 分钟后再问
         self.restart_reminder_cycle()
@@ -1316,20 +1544,14 @@ class MainWindow(QMainWindow):
             self._current_reminder.responded_at = datetime.now().isoformat()
             self.reminders_store.update(self._current_reminder)
             self._current_reminder = None
-        self._snoozed_until = datetime.now() + timedelta(minutes=FOLLOW_UP_MIN)
-        self._pending_visually_degraded = False
-        self.pending_timer.stop()
-        # snoozed 是 pending → False（清 pending，等 5 分钟后新 Reminder 抢占）
+        self._pending_deadline = None
         self.cfg.today.reminder_pending = False
-        self.cfg.save()
+        # 5 分钟后再提醒：墙上时钟到期时间落盘，重启/睡眠唤醒后仍兑现
+        self._schedule_followup("snoozed_followup")
         self.refresh()
         self.hide()
 
     # --- 响应态按钮 handler ---
-
-    def _on_reminder_drank(self) -> None:
-        # 用于 degraded_btn 补打卡（提醒态没这个按钮了）
-        self._record_drink(self.cfg.per_cup_ml, source="response")
 
     def _on_reminder_gulp(self) -> None:
         """喝一口：固定 50ml"""
@@ -1345,10 +1567,6 @@ class MainWindow(QMainWindow):
 
     def _on_reminder_snooze(self) -> None:
         self._record_snooze()
-        QTimer.singleShot(
-            FOLLOW_UP_MIN * 60 * 1000,
-            lambda: self.show_reminder(source="snoozed_followup"),
-        )
 
     def _on_reminder_skip(self) -> None:
         self._record_skip()
@@ -1496,6 +1714,7 @@ class MainWindow(QMainWindow):
             self._current_reminder.responded_at = datetime.now().isoformat()
             self.reminders_store.update(self._current_reminder)
             self._current_reminder = None
+        self._pending_deadline = None
 
         # 聚合当天数据
         today_reminders = [
@@ -1523,7 +1742,6 @@ class MainWindow(QMainWindow):
             daily_goal_ml_snapshot=goal_snapshot,
             is_goal_reached=self.cfg.today.drunk_ml >= goal_snapshot,
             final_growth_stage=_tree_stage(progress),
-            final_wilt_level=self.cfg.today.wilt_level,
             reminder_count=self.cfg.today.reminder_count,
             response_breakdown=breakdown,
             drink_entry_ids=[e.id for e in today_entries],
