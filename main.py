@@ -2023,9 +2023,21 @@ def main() -> int:
     cfg = Config.load()
     window = MainWindow(cfg)
     window._first_launch = is_first_launch
-    window.show()
 
     tray = setup_tray(app, window)
+
+    # 免打扰时段内启动（如开机自启动撞上清晨免打扰）→ 主窗口不露面，
+    # 直接留在托盘，气泡告知一声防止用户以为没启动。
+    # 例外：首次启动（新用户得看到界面）、托盘不可用（藏了就找不回来）
+    if not is_first_launch and tray is not None and window._in_quiet_hours():
+        tray.showMessage(
+            "喝水小助手",
+            "免打扰时段，我在托盘里待着，到点再提醒",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
+    else:
+        window.show()
     # 主窗口渲染后触发首次启动 Toast（延后 1 秒，避开入场动画重叠）
     window.maybe_show_first_launch_toast()
     if tray is None:
